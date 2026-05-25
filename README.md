@@ -14,7 +14,10 @@
 - [Features](#features)
 - [Requirements](#requirements)
 - [Quick Start](#quick-start)
+- [Permissions Summary](#permissions-summary)
 - [Cloudflare API Token](#cloudflare-api-token)
+- [How SSH Authentication Works](#how-ssh-authentication-works)
+- [Feature Activation Flow](#feature-activation-flow)
 - [Lifecycle & Commands](#lifecycle--commands)
 - [File Locations](#file-locations)
 - [Web Server Integration](#web-server-integration)
@@ -71,20 +74,63 @@ You can start **without a domain** (just save credentials), then add domains lat
 
 ## Quick Start
 
-### 1. Upload the script to your server
+### Step 1 — Upload the script to your server
+
+From your local machine:
 
 ```bash
 scp cf-manager.sh user@your-server:/tmp/
-ssh user@your-server
 ```
 
-### 2. Run the interactive menu
+Or download it directly on the server:
+
+```bash
+ssh user@your-server
+cd /tmp
+# (place cf-manager.sh here by any method: scp, wget, nano, etc.)
+```
+
+---
+
+### Step 2 — Give the script execute permission
+
+This is **required** before you can run it as an executable:
+
+```bash
+chmod +x /tmp/cf-manager.sh
+```
+
+Verify the permission was applied:
+
+```bash
+ls -l /tmp/cf-manager.sh
+```
+
+You should see `-rwxr-xr-x` (the `x` letters mean executable):
+
+```
+-rwxr-xr-x 1 user user 30204 May 25 17:49 /tmp/cf-manager.sh
+```
+
+> **Note:** If you skip `chmod +x`, you can still run it via `sudo bash /tmp/cf-manager.sh`, but giving it execute permission is the cleaner approach.
+
+---
+
+### Step 3 — Run the script (first time)
+
+Run as root using `sudo`:
+
+```bash
+sudo /tmp/cf-manager.sh
+```
+
+Or, if you didn't run `chmod +x`:
 
 ```bash
 sudo bash /tmp/cf-manager.sh
 ```
 
-### 3. Follow the menu
+The interactive menu will appear:
 
 ```
 1) Install (system-wide)
@@ -98,9 +144,49 @@ sudo bash /tmp/cf-manager.sh
 0) Exit
 ```
 
-**Recommended first-time flow:** `1 → 2 → 3 → 4`
+---
 
-After installation (step `1`), you can run `sudo cf-manager` from anywhere.
+### Step 4 — Install system-wide (recommended)
+
+Choose option **`1`** from the menu. This will:
+
+- Install required packages (`curl`, `jq`, `openssl`)
+- Copy the script to `/usr/local/bin/cf-manager` with mode `755`
+- Create `/etc/cf-manager/` with mode `700`
+
+After this, you can run the tool from anywhere with just:
+
+```bash
+sudo cf-manager
+```
+
+No more `bash`, no more full paths.
+
+---
+
+### Step 5 — Recommended first-time flow
+
+After installation, do this sequence:
+
+```bash
+sudo cf-manager setup                    # 1. Save your API token
+sudo cf-manager add-domain example.com   # 2. Protect your first domain
+sudo cf-manager status                   # 3. Verify everything is working
+```
+
+---
+
+## Permissions Summary
+
+| File | Required Mode | Why |
+|---|---|---|
+| `cf-manager.sh` (before install) | `755` (`chmod +x`) | So it can be executed directly |
+| `/usr/local/bin/cf-manager` (after install) | `755` | Standard executable location |
+| `/etc/cf-manager/` | `700` | Only root can read configs |
+| `/etc/cf-manager/config` | `600` | Contains the API token — root-only |
+| `/etc/ssl/cloudflare/*.key` | `600` | Private keys — root-only |
+
+All these permissions are **set automatically** by the script's `install` command. You only need to manually run `chmod +x` once on the initial download.
 
 ---
 
@@ -129,6 +215,299 @@ Create a token at: **https://dash.cloudflare.com/profile/api-tokens**
 6. **IP filtering:** optional, restrict to your server IP for extra security
 7. Click **Continue to summary → Create Token**
 8. Copy the token immediately — it's shown only once
+
+---
+
+## How SSH Authentication Works
+
+This tool **never asks for your Cloudflare email/password** and **never opens a browser**. All authentication happens through the Cloudflare REST API using an API Token over HTTPS — fully compatible with headless SSH sessions.
+
+### The authentication chain
+
+```
+┌──────────────┐    SSH       ┌──────────────┐   HTTPS    ┌──────────────────┐
+│  Your laptop │ ───────────► │ Linux server │ ─────────► │ api.cloudflare   │
+│   (terminal) │              │ (cf-manager) │   Token    │      .com        │
+└──────────────┘              └──────────────┘            └──────────────────┘
+                                      │
+                                      ▼
+                               /etc/cf-manager/
+                                  config (600)
+                              ┌────────────────┐
+                              │ CF_API_TOKEN   │
+                              │ CF_EMAIL       │
+                              │ CF_ACCOUNT_ID  │
+                              └────────────────┘
+```
+
+### Step-by-step what happens during `setup`
+
+When you run `sudo cf-manager setup` over SSH:
+
+#### 1. The tool prompts for the API Token
+
+```
+? Cloudflare API Token: ***************************
+? Cloudflare account email: you@example.com
+```
+
+The token is read with `read -s` (silent mode) — it is **never displayed on screen** and never echoed to your SSH session.
+
+#### 2. The token is sent to Cloudflare for verification
+
+The script sends an HTTPS request to Cloudflare's official token verification endpoint:
+
+```bash
+curl -sS -X GET \
+  -H "Authorization: Bearer YOUR_TOKEN" \
+  -H "Content-Type: application/json" \
+  https://api.cloudflare.com/client/v4/user/tokens/verify
+```
+
+A valid response looks like:
+
+```json
+{
+  "result": {
+    "id": "abc123...",
+    "status": "active"
+  },
+  "success": true,
+  "errors": [],
+  "messages": [...]
+}
+```
+
+If `success: true` and `status: active` → token is accepted.
+If not → script exits with a clear error and tells you which permissions are missing.
+
+#### 3. Account ID is resolved automatically
+
+The script then calls:
+
+```bash
+curl -sS -X GET \
+  -H "Authorization: Bearer YOUR_TOKEN" \
+  https://api.cloudflare.com/client/v4/accounts
+```
+
+- If you have **one account** → it's used automatically
+- If you have **multiple accounts** → the script shows a numbered list and you pick one
+
+#### 4. Credentials are saved securely
+
+The token, email, and account ID are written to `/etc/cf-manager/config` with strict permissions:
+
+```
+-rw------- 1 root root  /etc/cf-manager/config   (mode 600)
+drwx------ 2 root root  /etc/cf-manager/          (mode 700)
+```
+
+Only `root` can read this file. The token never appears in shell history, environment variables, or process listings.
+
+### Why this is safe over SSH
+
+| Concern | How it's handled |
+|---|---|
+| Token visible on screen | `read -s` hides it during input |
+| Token in shell history | Never typed as a command, only read interactively |
+| Token in process list | Sent as a header via `curl`, not as a command-line argument |
+| Token transmitted in clear | All traffic goes over **HTTPS to api.cloudflare.com** |
+| File readable by other users | Saved as mode `600`, root-only |
+| Token reused later | Loaded from file each run, never re-prompted |
+
+### Subsequent runs don't re-prompt
+
+Once `setup` is done, every other command (`add-domain`, `status`, `disable`, etc.) loads the saved token automatically:
+
+```bash
+# Internally:
+source /etc/cf-manager/config
+# Now $CF_API_TOKEN is available for all API calls
+```
+
+So all your future SSH sessions just work — no re-entering credentials.
+
+### Rotating or revoking the token
+
+**To rotate:**
+```bash
+# 1. Create a new token in the Cloudflare dashboard
+# 2. Re-run setup with the new value:
+sudo cf-manager setup
+# 3. Revoke the old token in the dashboard
+```
+
+**To revoke completely:**
+- Go to https://dash.cloudflare.com/profile/api-tokens
+- Click the token → **Roll** or **Delete**
+- The script will immediately fail until a new valid token is provided
+
+---
+
+## Feature Activation Flow
+
+Once authenticated, here's exactly **how each protection feature is activated** through the API — all without ever leaving your SSH session.
+
+### Visual flow: `add-domain example.com`
+
+```
+sudo cf-manager add-domain example.com
+        │
+        ▼
+┌────────────────────────────────────────────────────────────┐
+│ 1. Verify saved token (GET /user/tokens/verify)            │
+└────────────────────────────────────────────────────────────┘
+        │
+        ▼
+┌────────────────────────────────────────────────────────────┐
+│ 2. Check if zone exists (GET /zones?name=example.com)      │
+│    - If not: POST /zones to create it                      │
+│    - Display the assigned nameservers to update at         │
+│      your domain registrar                                 │
+└────────────────────────────────────────────────────────────┘
+        │
+        ▼
+┌────────────────────────────────────────────────────────────┐
+│ 3. Detect server public IP via api.ipify.org               │
+└────────────────────────────────────────────────────────────┘
+        │
+        ▼
+┌────────────────────────────────────────────────────────────┐
+│ 4. Create DNS records                                      │
+│    POST /zones/{id}/dns_records                            │
+│      type: A, name: example.com,     proxied: true         │
+│      type: A, name: www.example.com, proxied: true         │
+│    + any custom subdomains you add                         │
+└────────────────────────────────────────────────────────────┘
+        │
+        ▼
+┌────────────────────────────────────────────────────────────┐
+│ 5. Harden SSL/TLS                                          │
+│    PATCH /zones/{id}/settings/ssl                          │
+│    PATCH /zones/{id}/settings/always_use_https             │
+│    PATCH /zones/{id}/settings/automatic_https_rewrites     │
+│    PATCH /zones/{id}/settings/min_tls_version              │
+│    PATCH /zones/{id}/settings/tls_1_3                      │
+└────────────────────────────────────────────────────────────┘
+        │
+        ▼
+┌────────────────────────────────────────────────────────────┐
+│ 6. Enable security features                                │
+│    PATCH /zones/{id}/settings/security_level               │
+│    PATCH /zones/{id}/settings/browser_check                │
+│    PATCH /zones/{id}/settings/email_obfuscation            │
+└────────────────────────────────────────────────────────────┘
+        │
+        ▼
+┌────────────────────────────────────────────────────────────┐
+│ 7. Enable performance features                             │
+│    PATCH /zones/{id}/settings/brotli                       │
+│    PATCH /zones/{id}/settings/http3                        │
+│    PATCH /zones/{id}/settings/0rtt                         │
+└────────────────────────────────────────────────────────────┘
+        │
+        ▼
+┌────────────────────────────────────────────────────────────┐
+│ 8. Generate Origin Certificate (optional)                  │
+│    - openssl genrsa  → /etc/ssl/cloudflare/<domain>.key    │
+│    - openssl req     → CSR                                 │
+│    - POST /certificates with the CSR                       │
+│    - Save returned cert to <domain>.crt                    │
+└────────────────────────────────────────────────────────────┘
+        │
+        ▼
+┌────────────────────────────────────────────────────────────┐
+│ 9. Lock origin firewall (optional)                         │
+│    - Fetch https://www.cloudflare.com/ips-v4 and ips-v6    │
+│    - Add ACCEPT rules for each CF range on ports 80/443    │
+│    - Block all other traffic on those ports                │
+│    - Detects UFW / firewalld / iptables automatically      │
+└────────────────────────────────────────────────────────────┘
+        │
+        ▼
+┌────────────────────────────────────────────────────────────┐
+│ 10. Add domain to local tracking                           │
+│     echo "example.com|<zone_id>" >> /etc/cf-manager/domains│
+└────────────────────────────────────────────────────────────┘
+```
+
+### Behind every "✓ ok" message
+
+Every green check mark you see in the terminal corresponds to one API call. Here's a sample mapping:
+
+| Terminal output | API call made |
+|---|---|
+| `✓ Token is valid.` | `GET /user/tokens/verify` |
+| `✓ Account: a1b2c3...` | `GET /accounts` |
+| `✓ Zone created: xyz...` | `POST /zones` |
+| `✓ DNS A example.com → 1.2.3.4` | `POST /zones/{id}/dns_records` |
+| `✓ SSL mode: Full (Strict)` | `PATCH /zones/{id}/settings/ssl` |
+| `✓ Always Use HTTPS` | `PATCH /zones/{id}/settings/always_use_https` |
+| `✓ TLS 1.3` | `PATCH /zones/{id}/settings/tls_1_3` |
+| `✓ Brotli` | `PATCH /zones/{id}/settings/brotli` |
+| `✓ HTTP/3` | `PATCH /zones/{id}/settings/http3` |
+| `✓ Browser Integrity Check` | `PATCH /zones/{id}/settings/browser_check` |
+| `✓ Cloudflare is now paused for example.com` | `POST /zones/{id}/pause` |
+| `✓ Cloudflare is now active for example.com` | `POST /zones/{id}/unpause` |
+
+### Complete settings table
+
+These are the exact values the script applies to every protected domain:
+
+#### SSL / TLS
+
+| Setting | Value | Effect |
+|---|---|---|
+| `ssl` | `strict` | Encrypts visitor↔CF and CF↔origin, verifies origin cert |
+| `always_use_https` | `on` | Redirects all HTTP to HTTPS at the edge |
+| `automatic_https_rewrites` | `on` | Rewrites HTTP links in HTML to HTTPS |
+| `min_tls_version` | `1.2` | Blocks TLS 1.0/1.1 (deprecated, insecure) |
+| `tls_1_3` | `on` | Latest, fastest TLS version |
+
+#### Security
+
+| Setting | Value | Effect |
+|---|---|---|
+| `security_level` | `medium` | Challenges suspicious visitors based on threat score |
+| `browser_check` | `on` | Verifies HTTP headers to detect basic bots |
+| `email_obfuscation` | `on` | Hides email addresses from scrapers automatically |
+
+#### Performance
+
+| Setting | Value | Effect |
+|---|---|---|
+| `brotli` | `on` | Better compression than gzip → faster page loads |
+| `http3` | `on` | HTTP/3 (QUIC) — faster on mobile and lossy networks |
+| `0rtt` | `on` | 0-RTT resumption — eliminates one round-trip for repeat visits |
+
+All these can be modified later through the Cloudflare dashboard. The script just sets safe, recommended defaults.
+
+### Activating only specific features
+
+Currently, `add-domain` runs the full hardening pass. To toggle individual settings without re-running everything, you have two options:
+
+**Option 1 — Use the Cloudflare dashboard** at `https://dash.cloudflare.com/<account_id>/<domain>`
+
+**Option 2 — Call the API directly via curl**, using the saved token:
+
+```bash
+# Load the saved credentials
+source /etc/cf-manager/config
+
+# Get the zone ID for your domain
+ZONE_ID=$(curl -sS \
+  -H "Authorization: Bearer $CF_API_TOKEN" \
+  "https://api.cloudflare.com/client/v4/zones?name=example.com" \
+  | jq -r '.result[0].id')
+
+# Example: turn OFF email obfuscation
+curl -sS -X PATCH \
+  -H "Authorization: Bearer $CF_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  --data '{"value":"off"}' \
+  "https://api.cloudflare.com/client/v4/zones/$ZONE_ID/settings/email_obfuscation"
+```
 
 ---
 
